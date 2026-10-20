@@ -33,6 +33,16 @@ use tungstenite::protocol::Role;
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 
+pub type ClientAuthProvider = fn(String) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = ResultType<Vec<(String, String)>>> + Send>,
+>;
+static CLIENT_AUTH: std::sync::OnceLock<ClientAuthProvider> = std::sync::OnceLock::new();
+
+/// Installed by clients requiring an authenticated, strictly verified WSS entrance.
+pub fn set_client_auth_provider(provider: ClientAuthProvider) {
+    let _ = CLIENT_AUTH.set(provider);
+}
+
 pub struct WsFramedStream {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     addr: SocketAddr,
@@ -74,6 +84,29 @@ impl WsFramedStream {
         url: &str,
         ms_timeout: u64,
     ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        if let Some(provider) = CLIENT_AUTH.get() {
+            if !url.starts_with("wss://") {
+                bail!("Managed transport requires WSS");
+            }
+            let headers = provider(url.to_owned()).await?;
+            let mut request = url.into_client_request()?;
+            for (name, value) in headers {
+                let mut value = tungstenite::http::HeaderValue::from_str(&value)?;
+                value.set_sensitive(true);
+                request.headers_mut().insert(
+                    tungstenite::http::HeaderName::from_bytes(name.as_bytes())?, value,
+                );
+            }
+            // This path never consults the permissive TLS cache or retries without validation.
+            let connector = Self::get_connector(&TlsType::Rustls, false)?;
+            return match timeout(
+                Duration::from_millis(ms_timeout),
+                connect_async_tls_with_config(request, None, false, connector),
+            ).await? {
+                Ok((stream, _)) => Ok(stream),
+                Err(_) => bail!("Managed transport failed; verify network, certificate and device approval"),
+            };
+        }
         // to-do: websocket proxy.
 
         let tls_type = get_cached_tls_type(url);
