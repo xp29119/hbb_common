@@ -36,11 +36,20 @@ const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 pub type ClientAuthProvider = fn(String) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = ResultType<Vec<(String, String)>>> + Send>,
 >;
-static CLIENT_AUTH: std::sync::OnceLock<ClientAuthProvider> = std::sync::OnceLock::new();
+struct ClientAuth {
+    provider: ClientAuthProvider,
+    root_pem: Option<&'static [u8]>,
+}
+static CLIENT_AUTH: std::sync::OnceLock<ClientAuth> = std::sync::OnceLock::new();
 
 /// Installed by clients requiring an authenticated, strictly verified WSS entrance.
 pub fn set_client_auth_provider(provider: ClientAuthProvider) {
-    let _ = CLIENT_AUTH.set(provider);
+    let _ = CLIENT_AUTH.set(ClientAuth { provider, root_pem: None });
+}
+
+/// Adds trust only to this managed WSS path, without changing platform certificate stores.
+pub fn set_client_auth_provider_with_root(provider: ClientAuthProvider, root_pem: &'static [u8]) {
+    let _ = CLIENT_AUTH.set(ClientAuth { provider, root_pem: Some(root_pem) });
 }
 
 pub struct WsFramedStream {
@@ -80,15 +89,30 @@ impl WsFramedStream {
         }
     }
 
+    fn get_managed_connector(root_pem: Option<&[u8]>) -> ResultType<Option<Connector>> {
+        if let Some(pem) = root_pem {
+            use rustls_pki_types::{pem::PemObject, CertificateDer};
+            use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+            let mut roots = RootCertStore::empty();
+            roots.add(CertificateDer::from_pem_slice(pem)?)?;
+            let config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            Ok(Some(Connector::Rustls(Arc::new(config))))
+        } else {
+            Self::get_connector(&TlsType::Rustls, false)
+        }
+    }
+
     async fn connect(
         url: &str,
         ms_timeout: u64,
     ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        if let Some(provider) = CLIENT_AUTH.get() {
+        if let Some(auth) = CLIENT_AUTH.get() {
             if !url.starts_with("wss://") {
                 bail!("Managed transport requires WSS");
             }
-            let headers = provider(url.to_owned()).await?;
+            let headers = (auth.provider)(url.to_owned()).await?;
             let mut request = url.into_client_request()?;
             for (name, value) in headers {
                 let mut value = tungstenite::http::HeaderValue::from_str(&value)?;
@@ -98,7 +122,7 @@ impl WsFramedStream {
                 );
             }
             // This path never consults the permissive TLS cache or retries without validation.
-            let connector = Self::get_connector(&TlsType::Rustls, false)?;
+            let connector = Self::get_managed_connector(auth.root_pem)?;
             return match timeout(
                 Duration::from_millis(ms_timeout),
                 connect_async_tls_with_config(request, None, false, connector),
@@ -472,6 +496,40 @@ mod tests {
     use super::*;
     use crate::config::{keys, Config};
     use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+    /// Run explicitly against the deployed gateway; no account or device credentials are used.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires RDCONTROL_TLS_URL and RDCONTROL_TLS_ROOT pointing to the deployed gateway"]
+    async fn dedicated_ca_gateway_accepts_only_trusted_matching_ip() {
+        let endpoint = std::env::var("RDCONTROL_TLS_URL").unwrap();
+        let pem = std::fs::read(std::env::var("RDCONTROL_TLS_ROOT").unwrap()).unwrap();
+        let mut wrong = url::Url::parse(&endpoint).unwrap();
+        let host = wrong.host_str().unwrap().to_owned();
+        let addr = format!("{}:{}", host, wrong.port_or_known_default().unwrap());
+        wrong.set_host(Some("192.0.2.1")).unwrap();
+        for (target, root, expected_http) in [
+            (endpoint.as_str(), Some(pem.as_slice()), true),
+            (endpoint.as_str(), None, false),
+            (wrong.as_str(), Some(pem.as_slice()), false),
+        ] {
+            let connector = WsFramedStream::get_managed_connector(root).unwrap();
+            let tcp = TcpStream::connect(&addr).await.unwrap();
+            let result = timeout(Duration::from_secs(5),
+                tokio_tungstenite::client_async_tls_with_config(target, tcp, None, connector)
+            ).await.unwrap();
+            if expected_http {
+                assert!(matches!(result, Err(tungstenite::Error::Http(ref response))
+                    if response.status().as_u16() == 401));
+            } else {
+                assert!(matches!(result, Err(tungstenite::Error::Io(ref error))
+                    if matches!(error.get_ref().and_then(|cause|
+                        cause.downcast_ref::<tokio_rustls::rustls::Error>()),
+                        Some(tokio_rustls::rustls::Error::InvalidCertificate(_)))),
+                    "expected certificate rejection: {:?}", result.err());
+            }
+        }
+        assert!(WsFramedStream::get_managed_connector(Some(b"invalid certificate")).is_err());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_secured_stream_rejects_plaintext_text() {
